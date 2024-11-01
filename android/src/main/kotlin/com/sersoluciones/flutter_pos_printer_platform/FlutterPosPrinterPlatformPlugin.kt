@@ -164,7 +164,10 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
         messageChannel = null
         messageUSBChannel = null
 
-        bluetoothService.setHandler(null)
+        if (this::bluetoothService.isInitialized) {
+            bluetoothService.setHandler(null)
+        }
+
         adapter.setHandler(null)
     }
 
@@ -204,6 +207,10 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
     }
 
     override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
+        if (!this::bluetoothService.isInitialized) {
+            bluetoothService = BluetoothService.getInstance(bluetoothHandler)
+        }
+
         isScan = false
         when {
             call.method.equals("getBluetoothList") -> {
@@ -403,24 +410,36 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
         currentActivity = binding.activity
         binding.addRequestPermissionsResultListener(this)
         binding.addActivityResultListener(this)
-        bluetoothService.setActivity(currentActivity)
+        
+        if (!this::bluetoothService.isInitialized) {
+            bluetoothService.setActivity(currentActivity)
+        }
     }
 
     override fun onDetachedFromActivityForConfigChanges() {
         currentActivity = null
-        bluetoothService.setActivity(null)
+        
+        if (!this::bluetoothService.isInitialized) {
+            bluetoothService.setActivity(null)
+        }
     }
 
     override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
         currentActivity = binding.activity
         binding.addRequestPermissionsResultListener(this)
         binding.addActivityResultListener(this)
-        bluetoothService.setActivity(currentActivity)
+        
+        if (!this::bluetoothService.isInitialized) {
+            bluetoothService.setActivity(currentActivity)
+        }
     }
 
     override fun onDetachedFromActivity() {
         currentActivity = null
-        bluetoothService.setActivity(null)
+        
+        if (!this::bluetoothService.isInitialized) {
+            bluetoothService.setActivity(null)
+        }
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?): Boolean {
@@ -430,8 +449,13 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
 
                 Log.d(TAG, "PERMISSION_ENABLE_BLUETOOTH PERMISSION_GRANTED resultCode $resultCode")
                 if (resultCode == Activity.RESULT_OK)
-                    if (isScan)
+                    if (isScan) {
+                        if (!this::bluetoothService.isInitialized) {
+                            bluetoothService = BluetoothService.getInstance(bluetoothHandler)
+                        }
+
                         if (isBle) bluetoothService.scanBleDevice(channel) else bluetoothService.scanBluDevice(channel)
+                    }
 
             }
         }
@@ -455,8 +479,13 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
                 if (!grant) {
                     Toast.makeText(context, R.string.not_permissions, Toast.LENGTH_LONG).show()
                 } else {
-                    if (verifyIsBluetoothIsOn() && isScan)
+                    if (verifyIsBluetoothIsOn() && isScan) {
+                        if (!this::bluetoothService.isInitialized) {
+                            bluetoothService = BluetoothService.getInstance(bluetoothHandler)
+                        }
+                        
                         if (isBle) bluetoothService.scanBleDevice(channel) else bluetoothService.scanBluDevice(channel)
+                    }
                 }
                 return true
             }
