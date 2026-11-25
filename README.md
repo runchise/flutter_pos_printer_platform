@@ -173,6 +173,15 @@ info.plist add:
 - https://github.com/bailabs/esc-pos-printer-flutter
 - https://github.com/feedmepos/flutter_printer/tree/master/packages/flutter_pos_printer
 
+<p><sub>With contributions from</sub></p>
+<p>
+  <a href="https://menumiz.com/?utm_source=flutter_pos_printer_platform&utm_medium=readme&utm_campaign=oss-credit">
+    <img width="120"
+         title="Menumiz — the all-in-one restaurant POS with integrated AI, QR self-ordering, digital menus, and payments"
+         alt="Menumiz — best restaurant POS system: affordable cloud restaurant POS &amp; ePOS for small restaurants and cafes, with QR code self-ordering, online ordering, digital menu, e-Waiter AI ordering, table-side ordering, contactless payment, and restaurant management software"
+         src="https://menumizpublic.blob.core.windows.net/email/menumiz-transparent-maroon logo.png"/>
+  </a>
+</p>
 
 ## Support me
 
