@@ -5,11 +5,15 @@ import android.content.Context
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import android.os.SystemClock
 import android.util.Log
+import com.sersoluciones.flutter_pos_printer_platform.ConnectAnswer
+import com.sersoluciones.flutter_pos_printer_platform.PrintOutcome
 import com.sersoluciones.flutter_pos_printer_platform.bluetooth.SampleGattAttributes.Companion.CLIENT_CHARACTERISTIC_CONFIG
 import com.sersoluciones.flutter_pos_printer_platform.bluetooth.SampleGattAttributes.Companion.HEART_RATE_MEASUREMENT
-import io.flutter.plugin.common.MethodChannel
 import java.util.*
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 
 private const val TAG = "BluetoothBleConnection"
 
@@ -20,164 +24,237 @@ class BluetoothBleConnection(
 ) : IBluetoothConnection {
 
     private var bluetoothGatt: BluetoothGatt? = null
-    private var mCharacteristic: BluetoothGattCharacteristic? = null
+    private var session: GattSession? = null
+    private var mAddress: String? = null
     private var mState: Int = BluetoothConstants.STATE_NONE
 
-    /**
-     * Return the current connection state.
-     * Set the current state of the chat connection
-     */
-    @get:Synchronized
-    @set:Synchronized
-    override var state: Int
-        get() = mState
-        set(state) {
-            // Log.d(TAG, "setState() " + mState + " -> " + state);
+    @Volatile
+    private var writeCharacteristic: BluetoothGattCharacteristic? = null
 
-            if (state != BluetoothConstants.STATE_FAILED && state != BluetoothConstants.STATE_CONNECTED)
-            // Give the new state to the Handler so the UI Activity can update
-                mHandler.obtainMessage(BluetoothConstants.MESSAGE_STATE_CHANGE, state, -1).sendToTarget()
-            if (state == BluetoothConstants.STATE_FAILED) mState = BluetoothConstants.STATE_NONE
-            mState = state
-        }
+    @Volatile
+    private var payloadSize = DEFAULT_PAYLOAD_SIZE
+    private val writeAcks = LinkedBlockingQueue<WriteAck>()
+    private val writeLock = Any()
 
+    override val state: Int
+        @Synchronized get() = mState
 
-    /**
-     * connect to bluetooth device
-     */
-    override fun connect(address: String, result: MethodChannel.Result) {
-        if (!address.matches(Regex(BluetoothConstants.BLUETOOTH_REGEX))) return
-        if (mState == BluetoothConstants.STATE_CONNECTED) return
-        state = BluetoothConstants.STATE_CONNECTING
+    override val address: String?
+        @Synchronized get() = mAddress
 
-        BluetoothAdapter.getDefaultAdapter()?.let { adapter ->
-            try {
-                val device = adapter.getRemoteDevice(address)
-                val bluetoothGattCallback = ResponseBluetoothGattCallback(result)
+    @Synchronized
+    private fun changeState(newState: Int) {
+        mState = newState
+        mHandler.obtainMessage(BluetoothConstants.MESSAGE_STATE_CHANGE, newState, -1).sendToTarget()
+    }
 
-                // connect to the GATT server on the device
-                bluetoothGatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    device.connectGatt(
-                        mContext,
-                        autoConnect,
-                        bluetoothGattCallback,
-                        BluetoothDevice.TRANSPORT_LE
-                    )
-                } else {
-                    device.connectGatt(mContext, autoConnect, bluetoothGattCallback)
-                }
-
-                // Send the name of the connected device back to the UI Activity
-                val msg = mHandler.obtainMessage(BluetoothConstants.MESSAGE_DEVICE_NAME)
-                val bundle = Bundle()
-                bundle.putString(BluetoothConstants.DEVICE_NAME, device.name)
-                msg.data = bundle
-                mHandler.sendMessage(msg)
-
-            } catch (exception: IllegalArgumentException) {
-                state = BluetoothConstants.STATE_FAILED
-                Log.w(TAG, "Device not found with provided address.")
-                // Give the new state to the Handler so the UI Activity can update
-                mHandler.obtainMessage(BluetoothConstants.MESSAGE_STATE_CHANGE, state, -1, result).sendToTarget()
-                state = BluetoothConstants.STATE_NONE
-            }
-            // connect to the GATT server on the device
-        } ?: run {
-            Log.w(TAG, "BluetoothAdapter not initialized")
+    override fun connect(address: String, answer: ConnectAnswer) {
+        val adapter = BluetoothAdapter.getDefaultAdapter()
+        if (!address.matches(ADDRESS_PATTERN) || adapter == null) {
+            if (adapter == null) Log.w(TAG, "BluetoothAdapter not initialized")
+            answer.give(false)
             return
         }
 
+        val started = synchronized(this) {
+            if (mState == BluetoothConstants.STATE_CONNECTED && address.equals(mAddress, ignoreCase = true)) {
+                answer.give(true)
+                return
+            }
+            endSession()
+            val attempt = GattSession(answer)
+            session = attempt
+            mAddress = address
+            changeState(BluetoothConstants.STATE_CONNECTING)
+            val gatt = try {
+                val device = adapter.getRemoteDevice(address)
+                val gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    device.connectGatt(mContext, autoConnect, attempt, BluetoothDevice.TRANSPORT_LE)
+                } else {
+                    device.connectGatt(mContext, autoConnect, attempt)
+                }
+                val msg = mHandler.obtainMessage(BluetoothConstants.MESSAGE_DEVICE_NAME)
+                msg.data = Bundle().apply { putString(BluetoothConstants.DEVICE_NAME, device.name) }
+                mHandler.sendMessage(msg)
+                gatt
+            } catch (error: Exception) {
+                Log.w(TAG, "Could not start a BLE connection to $address", error)
+                null
+            }
+            if (gatt == null) {
+                session = null
+                changeState(BluetoothConstants.STATE_NONE)
+                answer.give(false)
+                return
+            }
+            bluetoothGatt = gatt
+            attempt
+        }
+        answer.onDeadline { closeSession(started) }
     }
 
-    /**
-     * finish connection
-     */
+    @Synchronized
     override fun stop() {
-        bluetoothGatt?.let { gatt ->
-            gatt.disconnect()
-            gatt.close()
-            bluetoothGatt = null
-            state = BluetoothConstants.STATE_NONE
+        endSession()
+        if (mState != BluetoothConstants.STATE_NONE) changeState(BluetoothConstants.STATE_NONE)
+    }
+
+    private fun closeSession(ended: GattSession) {
+        synchronized(this) {
+            if (session !== ended) return
+            endSession()
+            changeState(BluetoothConstants.STATE_NONE)
         }
     }
 
-    override fun write(out: ByteArray?) {
-        mCharacteristic?.let { characteristic ->
-//            val writeType = when {
-//                characteristic.isWritable() -> BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-//                characteristic.isWritableWithoutResponse() -> {
-//                    BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-//                }
-//                else -> error("Characteristic ${characteristic.uuid} cannot be written to")
-//            }
-
-            bluetoothGatt?.let { gatt ->
-                characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                characteristic.value = out
-                gatt.writeCharacteristic(mCharacteristic)
-                // Share the sent message back to the UI Activity
-                mHandler.obtainMessage(BluetoothConstants.MESSAGE_WRITE, -1, -1, out)
-                    .sendToTarget()
-            } ?: error("Not connected to a BLE device!")
+    @Synchronized
+    private fun endSession() {
+        val ended = session ?: return
+        session = null
+        writeCharacteristic = null
+        val gatt = bluetoothGatt
+        bluetoothGatt = null
+        writeAcks.offer(WriteAck(ended, LINK_LOST))
+        ended.answer.give(false)
+        try {
+            gatt?.disconnect()
+            gatt?.close()
+        } catch (error: SecurityException) {
+            Log.w(TAG, "Could not close the BLE connection", error)
         }
     }
 
-    /***
-     *
-     */
-    private inner class ResponseBluetoothGattCallback(private val result: MethodChannel.Result) : BluetoothGattCallback() {
-        private var mmChannelResult: MethodChannel.Result? = null
+    // See README.md, "Print results". A BLE write carries at most MTU - 3 bytes, so the job goes in pieces.
+    override fun send(bytes: ByteArray, confirmTimeoutMs: Long, writeTimeoutMs: Long): Map<String, Any?> {
+        val link = synchronized(this) {
+            val current = session
+            val gatt = bluetoothGatt
+            if (mState == BluetoothConstants.STATE_CONNECTED && current != null && gatt != null) current to gatt else null
+        } ?: return PrintOutcome.failed("BLE printer is not connected")
+        val (writingSession, gatt) = link
+        val characteristic = writeCharacteristic
+            ?: return PrintOutcome.failed("BLE printer has no characteristic the app can write to")
+        val withResponse = characteristic.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0
+        characteristic.writeType =
+            if (withResponse) BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            else BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
 
-        init {
-            mmChannelResult = result
+        synchronized(writeLock) {
+            var offset = 0
+            while (offset < bytes.size) {
+                val end = minOf(offset + payloadSize, bytes.size)
+                writeAcks.clear()
+                characteristic.value = bytes.copyOfRange(offset, end)
+                if (!writeWhenGattIsFree(gatt, characteristic)) {
+                    return stoppedAt(offset, "BLE printer refused the job at byte $offset of ${bytes.size}")
+                }
+                when (val status = awaitAck(writingSession)) {
+                    null -> {
+                        closeSession(writingSession)
+                        return PrintOutcome.cutOff(
+                            "BLE printer did not answer at byte $offset of ${bytes.size} within ${PIECE_TIMEOUT_MS / 1000} s. " +
+                                "The BLE connection was closed, so the next job connects again"
+                        )
+                    }
+                    LINK_LOST -> return PrintOutcome.cutOff("BLE connection dropped at byte $offset of ${bytes.size}")
+                    BluetoothGatt.GATT_SUCCESS -> offset = end
+                    else -> return stoppedAt(offset, "BLE printer rejected the job at byte $offset of ${bytes.size}, GATT status $status")
+                }
+            }
         }
+        return if (withResponse) PrintOutcome.delivered(null)
+        else PrintOutcome.sent(null, "BLE printer took every byte, but it cannot confirm writes")
+    }
+
+    private fun awaitAck(writingSession: GattSession): Int? {
+        val deadline = SystemClock.elapsedRealtime() + PIECE_TIMEOUT_MS
+        while (true) {
+            val left = deadline - SystemClock.elapsedRealtime()
+            if (left <= 0) return null
+            val ack = writeAcks.poll(left, TimeUnit.MILLISECONDS) ?: return null
+            if (ack.session === writingSession) return ack.status
+        }
+    }
+
+    private fun stoppedAt(offset: Int, reason: String): Map<String, Any?> =
+        if (offset == 0) PrintOutcome.failed(reason) else PrintOutcome.cutOff(reason)
+
+    // writeCharacteristic returns false while another GATT operation, such as a descriptor write, is still running.
+    private fun writeWhenGattIsFree(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic): Boolean {
+        val deadline = SystemClock.elapsedRealtime() + GATT_BUSY_TIMEOUT_MS
+        while (state == BluetoothConstants.STATE_CONNECTED) {
+            if (gatt.writeCharacteristic(characteristic)) return true
+            if (SystemClock.elapsedRealtime() >= deadline) return false
+            Thread.sleep(50)
+        }
+        return false
+    }
+
+    private class WriteAck(val session: BluetoothGattCallback, val status: Int)
+
+    private inner class GattSession(val answer: ConnectAnswer) : BluetoothGattCallback() {
+        private var ready = false
+
+        private val isCurrent: Boolean
+            get() = synchronized(this@BluetoothBleConnection) { session === this }
 
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             Log.d(TAG, " ---------- onConnectionStateChange: newState $newState status $status")
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    // successfully connected to the GATT Server
-                    Log.d(TAG, "onConnectionStateChange: STATE_CONNECTED")
-                    state = BluetoothConstants.STATE_CONNECTED
-
-                    if (mmChannelResult != null) {
-                        // Give the new state to the Handler so the UI Activity can update
-                        mHandler.obtainMessage(BluetoothConstants.MESSAGE_STATE_CHANGE, state, -1, result).sendToTarget()
-                        mmChannelResult = null
+                    synchronized(this@BluetoothBleConnection) {
+                        if (session !== this) return
+                        payloadSize = DEFAULT_PAYLOAD_SIZE
+                        writeCharacteristic = null
+                    }
+                    if (!gatt.requestMtu(REQUESTED_MTU)) discoverServices(gatt)
+                }
+                BluetoothProfile.STATE_CONNECTING -> synchronized(this@BluetoothBleConnection) {
+                    if (session === this) changeState(BluetoothConstants.STATE_CONNECTING)
+                }
+                BluetoothProfile.STATE_DISCONNECTED -> synchronized(this@BluetoothBleConnection) {
+                    if (session !== this) return
+                    if (ready) {
+                        writeCharacteristic = null
+                        writeAcks.offer(WriteAck(this, LINK_LOST))
                     } else {
-                        mHandler.obtainMessage(BluetoothConstants.MESSAGE_STATE_CHANGE, state, -1).sendToTarget()
+                        endSession()
                     }
-                    // Attempts to discover services after successful connection.
-                    bluetoothGatt?.discoverServices()
-
-                }
-                BluetoothProfile.STATE_CONNECTING -> {
-                    Log.d(TAG, "onConnectionStateChange: STATE_CONNECTING")
-                    // connecting from the GATT Server
-                    state = BluetoothConstants.STATE_CONNECTING
-                }
-                BluetoothProfile.STATE_DISCONNECTED -> {
-                    Log.d(TAG, "onConnectionStateChange: STATE_DISCONNECTED")
-                    if (mmChannelResult != null) {
-                        // disconnected from the GATT Server
-                        state = BluetoothConstants.STATE_FAILED
-                        // Give the new state to the Handler so the UI Activity can update
-                        mHandler.obtainMessage(BluetoothConstants.MESSAGE_STATE_CHANGE, state, -1, result).sendToTarget()
-                        mmChannelResult = null
-                    }
-
-                    state = BluetoothConstants.STATE_NONE
+                    changeState(BluetoothConstants.STATE_NONE)
                 }
             }
         }
 
-        override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            if (!isCurrent) return
+            if (status == BluetoothGatt.GATT_SUCCESS) payloadSize = mtu - 3
+            discoverServices(gatt)
+        }
 
-                displayGattServices(getSupportedGattServices())
-            } else {
-                Log.w(TAG, "onServicesDiscovered received: $status")
+        private fun discoverServices(gatt: BluetoothGatt) {
+            if (!gatt.discoverServices()) giveUp("BLE printer would not start service discovery")
+        }
+
+        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            if (!isCurrent) return
+            if (status != BluetoothGatt.GATT_SUCCESS) return giveUp("BLE service discovery failed, GATT status $status")
+            val characteristics = gatt.services.orEmpty().flatMap { it.characteristics }
+            val writable = characteristics.firstOrNull { it.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0 }
+                ?: characteristics.firstOrNull { it.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0 }
+                ?: return giveUp("BLE printer has no characteristic the app can write to")
+            synchronized(this@BluetoothBleConnection) {
+                if (session !== this) return
+                if (!ready && !answer.give(true)) return
+                ready = true
+                writeCharacteristic = writable
+                changeState(BluetoothConstants.STATE_CONNECTED)
             }
+            characteristics.forEach { setCharacteristicNotification(gatt, it) }
+        }
+
+        private fun giveUp(reason: String) {
+            Log.w(TAG, reason)
+            closeSession(this)
         }
 
         override fun onCharacteristicRead(
@@ -202,6 +279,7 @@ class BluetoothBleConnection(
             characteristic: BluetoothGattCharacteristic,
             status: Int
         ) {
+            if (isCurrent) writeAcks.offer(WriteAck(this, status))
             with(characteristic) {
                 when (status) {
                     BluetoothGatt.GATT_SUCCESS -> {
@@ -227,85 +305,23 @@ class BluetoothBleConnection(
         }
     }
 
-
-    /***
-     * Demonstrates how to iterate through the supported GATT
-     * Services/Characteristics.
-     * In this sample, we populate the data structure that is bound to the
-     * ExpandableListView on the UI.
-     */
-    private fun displayGattServices(gattServices: List<BluetoothGattService>?) {
-        if (gattServices == null) return
-        var uuid: String?
-
-        // Loops through available GATT Services.
-        gattServices.forEach { gattService ->
-            uuid = gattService.uuid.toString()
-
-            // Loops through available Characteristics.
-            gattService.characteristics.forEach { gattCharacteristic ->
-                uuid = gattCharacteristic.uuid.toString()
-//                Log.d(
-//                    TAG,
-//                    " ------- gattCharacteristics -> name: ${
-//                        SampleGattAttributes.lookup(
-//                            uuid!!,
-//                            "Servicio desconocido"
-//                        )!!
-//                    } uuid: $uuid"
-//                )
-
-                setCharacteristicNotification(gattCharacteristic)
-
-            }
-        }
-
-    }
-
-    fun getSupportedGattServices(): List<BluetoothGattService>? {
-        return bluetoothGatt?.services
-    }
-
-
-    // Read from the InputStream
     private var buffer = ArrayList<Byte>()
 
     private fun broadcastUpdate(characteristic: BluetoothGattCharacteristic?) {
-
-        if (characteristic != null) {
-            when (characteristic.uuid) {
-                UUID_HEART_RATE_MEASUREMENT -> {
-
-                }
-                else -> {
-                    // For all other profiles, writes the data formatted in HEX.
-                    val data: ByteArray? = characteristic.value
-                    if (data?.isNotEmpty() == true) {
-
-                        // 30 33 20 30 30 20 30 30 20 30 30 20 30 30 20 30 30 20 44 38 20 38 32 20 0D 0A
-                        // 48 51 32 48 48 32 48 48 32 48 48 32 48 48 32 48 48 32 68 56 32 56 50 32 13 10
-                        for (byte in data) {
-
-                            buffer.add(byte)
-//                            buffer += byte
-                            if (byte.toInt() == 13) {
-                                sendMsg()
-                                break
-                            }
-                        }
-
-                    }
+        if (characteristic == null || characteristic.uuid == UUID_HEART_RATE_MEASUREMENT) return
+        val data: ByteArray? = characteristic.value
+        if (data?.isNotEmpty() == true) {
+            for (byte in data) {
+                buffer.add(byte)
+                if (byte.toInt() == 13) {
+                    sendMsg()
+                    break
                 }
             }
         }
     }
 
     private fun sendMsg() {
-        val hexString: String = buffer.joinToString(separator = " ") {
-            String.format("%02X", it)
-        }
-//        Log.d(TAG, "sendMsg data $hexString value size ${hexString.length}")
-        // Send the obtained bytes to the UI Activity
         mHandler.obtainMessage(
             BluetoothConstants.MESSAGE_READ,
             buffer.size,
@@ -314,69 +330,26 @@ class BluetoothBleConnection(
         ).sendToTarget()
 
         buffer = arrayListOf()
-
     }
 
-    @Suppress("unused")
-    fun readCharacteristic(characteristic: BluetoothGattCharacteristic) {
-        bluetoothGatt?.readCharacteristic(characteristic) ?: run {
-            Log.w(TAG, "BluetoothGatt not initialized")
-            return
-        }
+    private fun setCharacteristicNotification(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+        gatt.setCharacteristicNotification(characteristic, true)
+        val descriptor: BluetoothGattDescriptor =
+            characteristic.getDescriptor(UUID.fromString(CLIENT_CHARACTERISTIC_CONFIG)) ?: return
+        descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        gatt.writeDescriptor(descriptor)
     }
-
-    private fun setCharacteristicNotification(
-        characteristic: BluetoothGattCharacteristic
-    ) {
-        bluetoothGatt?.let { gatt ->
-
-//            if (UUID_MEASUREMENT == characteristic.uuid) {
-            gatt.setCharacteristicNotification(characteristic, true)
-
-            val descriptor: BluetoothGattDescriptor =
-                characteristic.getDescriptor(UUID.fromString(CLIENT_CHARACTERISTIC_CONFIG))
-                    ?: return
-            mCharacteristic = characteristic
-//            Log.w(TAG, " *************** BluetoothGatt descriptor ${characteristic.uuid}")
-            descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-            gatt.writeDescriptor(descriptor)
-//            }
-        } ?: run {
-            Log.w(TAG, "BluetoothGatt not initialized")
-        }
-    }
-
-    @Suppress("unused")
-    fun disableNotifications(characteristic: BluetoothGattCharacteristic) {
-        bluetoothGatt?.let { gatt ->
-            characteristic.getDescriptor(UUID.fromString(CLIENT_CHARACTERISTIC_CONFIG))
-                ?.let { cccDescriptor ->
-                    if (bluetoothGatt?.setCharacteristicNotification(
-                            characteristic,
-                            false
-                        ) == false
-                    ) {
-                        Log.e(
-                            "ConnectionManager",
-                            "setCharacteristicNotification failed for ${characteristic.uuid}"
-                        )
-                        return
-                    }
-
-                    cccDescriptor.value = BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
-                    gatt.writeDescriptor(cccDescriptor)
-                } ?: Log.e(
-                "ConnectionManager",
-                "${characteristic.uuid} doesn't contain the CCC descriptor!"
-            )
-        }
-    }
-
 
     companion object {
 
         val UUID_HEART_RATE_MEASUREMENT: UUID =
             UUID.fromString(HEART_RATE_MEASUREMENT)
 
+        private const val DEFAULT_PAYLOAD_SIZE = 20
+        private const val REQUESTED_MTU = 247
+        private const val PIECE_TIMEOUT_MS = 5000L
+        private const val GATT_BUSY_TIMEOUT_MS = 2000L
+        private const val LINK_LOST = -1
+        private val ADDRESS_PATTERN = Regex(BluetoothConstants.BLUETOOTH_REGEX)
     }
 }

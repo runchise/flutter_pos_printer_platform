@@ -4,7 +4,15 @@
 #include <map>
 #include <memory>
 #include <sstream>
+#include <string>
 #include <vector>
+
+// See README.md, "Print results", and printResultFromPlatformReply in lib/src/print_result.dart.
+struct SpoolerOutcome
+{
+    std::string outcome;
+    std::string reason;
+};
 
 struct Printer
 {
@@ -27,12 +35,13 @@ class PrintManager
 {
 private:
     static HANDLE _hPrinter;
+    static void abandonJob();
 
 public:
     PrintManager(){};
     static std::vector<Printer> listPrinters();
     static BOOL pickPrinter(std::string pPrinterName);
-    static BOOL printBytes(std::vector<uint8_t> data);
+    static SpoolerOutcome printBytes(const std::vector<uint8_t> &data);
     static BOOL close();
     operator HANDLE() { return _hPrinter; }
 };

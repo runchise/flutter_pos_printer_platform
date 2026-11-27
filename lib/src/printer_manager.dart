@@ -60,7 +60,7 @@ class PrinterManager {
     }
   }
 
-  Future<bool> send({required PrinterType type, required List<int> bytes}) async {
+  Future<PrintResult> send({required PrinterType type, required List<int> bytes}) async {
     if (type == PrinterType.bluetooth && (Platform.isIOS || Platform.isAndroid)) {
       return await bluetoothPrinterConnector.send(bytes);
     } else if (type == PrinterType.usb && (Platform.isAndroid || Platform.isWindows)) {

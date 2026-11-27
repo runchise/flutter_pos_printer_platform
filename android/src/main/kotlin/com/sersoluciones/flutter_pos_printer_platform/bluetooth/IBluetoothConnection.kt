@@ -1,9 +1,11 @@
 package com.sersoluciones.flutter_pos_printer_platform.bluetooth
-import io.flutter.plugin.common.MethodChannel.Result
+
+import com.sersoluciones.flutter_pos_printer_platform.ConnectAnswer
 
 interface IBluetoothConnection {
-    fun connect(address: String, result: Result)
+    val state: Int
+    val address: String?
+    fun connect(address: String, answer: ConnectAnswer)
     fun stop()
-    fun write(out: ByteArray?)
-    var state: Int
+    fun send(bytes: ByteArray, confirmTimeoutMs: Long, writeTimeoutMs: Long): Map<String, Any?>
 }

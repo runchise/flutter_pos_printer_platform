@@ -63,68 +63,83 @@ std::vector<Printer> PrintManager::listPrinters()
 
 BOOL PrintManager::pickPrinter(std::string printerName)
 {
+    close();
     return OpenPrinterW((LPWSTR)fromUtf8(printerName).c_str(), &_hPrinter, NULL);
 }
 
-BOOL PrintManager::printBytes(std::vector<uint8_t> data)
+static std::string withError(const std::string &reason, DWORD error)
 {
-    BOOL status = false;
-    BOOL success = true;
-    DOC_INFO_1W docInfo;
-    DWORD dwJob = 0;
-    DWORD written = 0;
+    return reason + " (Windows error " + std::to_string(error) + ")";
+}
 
-    if (_hPrinter == INVALID_HANDLE_VALUE)
+void PrintManager::abandonJob()
+{
+    AbortPrinter(_hPrinter);
+    // AbortPrinter has no effect on a printer that does not spool, so the handle is closed to drop the started document.
+    close();
+}
+
+SpoolerOutcome PrintManager::printBytes(const std::vector<uint8_t> &data)
+{
+    if (_hPrinter == NULL || _hPrinter == INVALID_HANDLE_VALUE)
     {
-        //  throw std::exception("Printer handle is invalid.");
-        success =  false;
+        return SpoolerOutcome{"failed", "No Windows printer is open. Connect to the printer first."};
     }
 
-    // Fill in default value of the print document
+    DOC_INFO_1W docInfo;
     docInfo.pDocName = L"FeedMe POS Print Job";
     docInfo.pOutputFile = NULL;
     docInfo.pDatatype = L"RAW";
 
-    // Inform the spooler there is a new document
-    dwJob = StartDocPrinterW(_hPrinter, 1, (LPBYTE)&docInfo);
-    if (dwJob > 0)
+    if (StartDocPrinterW(_hPrinter, 1, (LPBYTE)&docInfo) == 0)
     {
-        // Start page
-        status = StartPagePrinter(_hPrinter);
-        if (status)
-        {
-            // Send data to the printer
-            status = WritePrinter(_hPrinter, (LPVOID)std::data(data), (DWORD)data.size(), &written);
-            EndPagePrinter(_hPrinter);
-        }
-        else
-        {
-            // throw std::exception("StartPagePrinter error.");
-            success =  false;
-        }
-        // Inform the spooler that the document hsa ended
-        EndDocPrinter(_hPrinter);
+        return SpoolerOutcome{"failed", withError("Windows print spooler did not start the job", GetLastError())};
     }
-    else
+    if (!StartPagePrinter(_hPrinter))
     {
-        // throw std::exception("StartDocPrinterW error.");
-        success = false;
+        DWORD error = GetLastError();
+        abandonJob();
+        return SpoolerOutcome{"failed", withError("Windows print spooler did not start the page", error)};
     }
 
-    // Check if all data are flushed
-    if (written != data.size())
+    DWORD written = 0;
+    BOOL wrote = WritePrinter(_hPrinter, (LPVOID)data.data(), (DWORD)data.size(), &written);
+    if (!wrote || written != data.size())
     {
-        // throw std::exception("Fail to send all bytes");
-        success =  false;
+        DWORD error = GetLastError();
+        abandonJob();
+        if (written == 0)
+        {
+            return SpoolerOutcome{"failed", withError("Windows print spooler took no byte of the job", error)};
+        }
+        return SpoolerOutcome{
+            "cutOff",
+            withError("Windows print spooler took " + std::to_string(written) + " of " + std::to_string(data.size()) +
+                          " bytes, then the job was cancelled and the printer closed. The printer may have printed part of it",
+                      error)};
     }
 
-    return success;
+    if (!EndPagePrinter(_hPrinter))
+    {
+        DWORD error = GetLastError();
+        abandonJob();
+        return SpoolerOutcome{"cutOff", withError("Windows print spooler took every byte but could not end the page, so the job was cancelled", error)};
+    }
+    if (!EndDocPrinter(_hPrinter))
+    {
+        DWORD error = GetLastError();
+        abandonJob();
+        return SpoolerOutcome{"cutOff", withError("Windows print spooler took every byte but could not end the job, so the job was cancelled", error)};
+    }
+    return SpoolerOutcome{"sent", "Windows print spooler took every byte. The printer gives no confirmation through the spooler."};
 }
 
 BOOL PrintManager::close()
 {
-    if (_hPrinter != INVALID_HANDLE_VALUE)
-        return ClosePrinter(_hPrinter);
+    if (_hPrinter == NULL || _hPrinter == INVALID_HANDLE_VALUE)
+        return false;
 
-    return false;
+    BOOL closed = ClosePrinter(_hPrinter);
+    _hPrinter = NULL;
+    return closed;
 }

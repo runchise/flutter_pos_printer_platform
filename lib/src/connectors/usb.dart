@@ -1,6 +1,7 @@
 import 'dart:async';
-import 'dart:io';
-import 'dart:typed_data';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 
 import 'package:flutter_pos_printer_platform_image_3/discovery.dart';
 import 'package:flutter_pos_printer_platform_image_3/flutter_pos_printer_platform_image_3.dart';
@@ -50,7 +51,7 @@ class UsbPrinterConnector implements PrinterConnector<UsbPrinterInput> {
       : vendorId = '',
         productId = '',
         name = '' {
-    if (Platform.isAndroid)
+    if (defaultTargetPlatform == TargetPlatform.android)
       flutterPrinterEventChannelUSB.receiveBroadcastStream().listen((data) {
         if (data is int) {
           // log('Received event status usb: $data');
@@ -84,13 +85,13 @@ class UsbPrinterConnector implements PrinterConnector<UsbPrinterInput> {
 
   /// Gets the current state of the Bluetooth module
   Stream<USBStatus> get currentStatus async* {
-    if (Platform.isAndroid) {
+    if (defaultTargetPlatform == TargetPlatform.android) {
       yield* _statusStream.cast<USBStatus>();
     }
   }
 
   static DiscoverResult<UsbPrinterInfo> discoverPrinters() async {
-    if (Platform.isAndroid) {
+    if (defaultTargetPlatform == TargetPlatform.android) {
       final List<dynamic> results = await flutterPrinterChannel.invokeMethod('getList');
       return results
           .map((dynamic r) => PrinterDiscovered<UsbPrinterInfo>(
@@ -106,7 +107,7 @@ class UsbPrinterConnector implements PrinterConnector<UsbPrinterInput> {
               ))
           .toList();
     }
-    if (Platform.isWindows) {
+    if (defaultTargetPlatform == TargetPlatform.windows) {
       final List<dynamic> results = await flutterPrinterChannel.invokeMethod('getList');
       return results
           .map((dynamic result) => PrinterDiscovered<UsbPrinterInfo>(
@@ -119,7 +120,7 @@ class UsbPrinterConnector implements PrinterConnector<UsbPrinterInput> {
   }
 
   Stream<PrinterDevice> discovery() async* {
-    if (Platform.isAndroid) {
+    if (defaultTargetPlatform == TargetPlatform.android) {
       final List<dynamic> results = await flutterPrinterChannel.invokeMethod('getList');
       for (final device in results) {
         var r = await device;
@@ -130,7 +131,7 @@ class UsbPrinterConnector implements PrinterConnector<UsbPrinterInput> {
           // name: r['name'],
         );
       }
-    } else if (Platform.isWindows) {
+    } else if (defaultTargetPlatform == TargetPlatform.windows) {
       final List<dynamic> results = await flutterPrinterChannel.invokeMethod('getList');
       for (final device in results) {
         var r = await device;
@@ -142,26 +143,34 @@ class UsbPrinterConnector implements PrinterConnector<UsbPrinterInput> {
     }
   }
 
-  Future<bool> _connect({UsbPrinterInput? model}) async {
-    if (Platform.isAndroid) {
-      Map<String, dynamic> params = {"vendor": int.parse(model?.vendorId ?? vendorId), "product": int.parse(model?.productId ?? productId)};
-      return await flutterPrinterChannel.invokeMethod('connectPrinter', params);
-    } else if (Platform.isWindows) {
-      Map<String, dynamic> params = {"name": model?.name ?? name};
+  Future<bool> _connect(UsbPrinterInput model) async {
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      Map<String, dynamic> params = {
+        "vendor": int.parse(model.vendorId ?? vendorId),
+        "product": int.parse(model.productId ?? productId),
+        "permissionTimeoutMs": permissionTimeout.inMilliseconds,
+      };
+      final granted = flutterPrinterChannel.invokeMethod<bool>('connectPrinter', params).then((value) => value ?? false);
+      return await granted.timeout(permissionTimeout + nativeDeadlineMargin, onTimeout: () => false);
+    } else if (defaultTargetPlatform == TargetPlatform.windows) {
+      Map<String, dynamic> params = {"name": model.name ?? name};
       return await flutterPrinterChannel.invokeMethod('connectPrinter', params) == 1 ? true : false;
     }
     return false;
   }
 
   Future<bool> _close() async {
-    if (Platform.isWindows) return await flutterPrinterChannel.invokeMethod('close') == 1 ? true : false;
+    if (defaultTargetPlatform == TargetPlatform.windows) return await flutterPrinterChannel.invokeMethod('close') == 1 ? true : false;
     return false;
   }
 
+  ({String vendorId, String productId})? _lastConnected;
+
   @override
   Future<bool> connect(UsbPrinterInput model) async {
+    _lastConnected = (vendorId: model.vendorId ?? vendorId, productId: model.productId ?? productId);
     try {
-      return await _connect(model: model);
+      return await _connect(model);
     } catch (e) {
       return false;
     }
@@ -176,26 +185,42 @@ class UsbPrinterConnector implements PrinterConnector<UsbPrinterInput> {
     }
   }
 
+  Duration permissionTimeout = const Duration(seconds: 60);
+  Duration statusTimeout = const Duration(seconds: 2);
+
+  // See README.md, "Print results" (wrong printer).
   @override
-  Future<bool> send(List<int> bytes) async {
-    if (Platform.isAndroid)
-      try {
-        // final connected = await _connect();
-        // if (!connected) return false;
-        Map<String, dynamic> params = {"bytes": bytes};
-        return await flutterPrinterChannel.invokeMethod('printBytes', params);
-      } catch (e) {
-        return false;
+  Future<PrintResult> send(List<int> bytes) async {
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      final printer = _lastConnected;
+      final vendor = int.tryParse(printer?.vendorId ?? '');
+      final product = int.tryParse(printer?.productId ?? '');
+      if (printer != null && (vendor == null || product == null)) {
+        return PrintFailed(
+          'USB printer vendor id "${printer.vendorId}" or product id "${printer.productId}" is not a number, so the job was not sent',
+        );
       }
-    else if (Platform.isWindows)
       try {
-        Map<String, dynamic> params = {"bytes": Uint8List.fromList(bytes)};
-        return await flutterPrinterChannel.invokeMethod('printBytes', params) == 1 ? true : false;
-      } catch (e) {
-        await this._close();
-        return false;
+        final reply = await flutterPrinterChannel.invokeMethod<Object?>('printBytes', {
+          'bytes': bytes,
+          'statusTimeoutMs': statusTimeout.inMilliseconds,
+          if (vendor != null) 'vendor': vendor,
+          if (product != null) 'product': product,
+        });
+        return printResultFromPlatformReply(reply);
+      } on PlatformException catch (error) {
+        return PrintCutOff('USB send stopped, so part of the job may have been sent: ${error.message ?? error.code}');
       }
-    else
-      return false;
+    }
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      try {
+        final reply = await flutterPrinterChannel.invokeMethod<Object?>('printBytes', {'bytes': Uint8List.fromList(bytes)});
+        return printResultFromPlatformReply(reply);
+      } on PlatformException catch (error) {
+        await _close();
+        return PrintCutOff('USB send stopped, so part of the job may have been sent: ${error.message ?? error.code}');
+      }
+    }
+    return const PrintFailed('USB printing works only on Android and Windows');
   }
 }

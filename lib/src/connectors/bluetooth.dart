@@ -1,6 +1,6 @@
 import 'dart:async';
-import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_pos_printer_platform_image_3/discovery.dart';
 import 'package:flutter_pos_printer_platform_image_3/flutter_pos_printer_platform_image_3.dart';
@@ -26,21 +26,22 @@ class BluetoothPrinterDevice {
 }
 
 class BluetoothPrinterConnector implements PrinterConnector<BluetoothPrinterInput> {
-  // ignore: unused_element
-  BluetoothPrinterConnector._({this.address = "", this.isBle = false}) {
-    if (Platform.isAndroid)
+  BluetoothPrinterConnector._()
+      : address = "",
+        isBle = false {
+    if (defaultTargetPlatform == TargetPlatform.android)
       flutterPrinterChannel.setMethodCallHandler((MethodCall call) {
         _methodStreamController.add(call);
         return Future(() => null);
       });
 
-    if (Platform.isIOS)
+    if (defaultTargetPlatform == TargetPlatform.iOS)
       iosChannel.setMethodCallHandler((MethodCall call) {
         _methodStreamController.add(call);
         return Future(() => null);
       });
 
-    if (Platform.isAndroid)
+    if (defaultTargetPlatform == TargetPlatform.android)
       flutterPrinterEventChannelBT.receiveBroadcastStream().listen((data) {
         if (data is int) {
           // log('Received event status: $data');
@@ -49,7 +50,7 @@ class BluetoothPrinterConnector implements PrinterConnector<BluetoothPrinterInpu
         }
       });
 
-    if (Platform.isIOS) {
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
       //  iosChannel.invokeMethod('state').then((s) => s);
       iosStateChannel.receiveBroadcastStream().listen((data) {
         if (data is int) {
@@ -96,21 +97,13 @@ class BluetoothPrinterConnector implements PrinterConnector<BluetoothPrinterInpu
   setName(String name) => this.name = name;
   setIsBle(bool isBle) => this.isBle = isBle;
 
-  static DiscoverResult<BluetoothPrinterDevice> discoverPrinters({bool isBle = false}) async {
-    if (Platform.isAndroid) {
-      final List<dynamic> results =
-          isBle ? await flutterPrinterChannel.invokeMethod('getBluetoothLeList') : await flutterPrinterChannel.invokeMethod('getBluetoothList');
-      return results
-          .map((dynamic r) => PrinterDiscovered<BluetoothPrinterDevice>(
-                name: r['name'],
-                detail: BluetoothPrinterDevice(
-                  address: r['address'],
-                ),
-              ))
-          .toList();
-    }
-    return [];
-  }
+  static DiscoverResult<BluetoothPrinterDevice> discoverPrinters({bool isBle = false}) => instance
+      .discovery(isBle: isBle)
+      .map((device) => PrinterDiscovered<BluetoothPrinterDevice>(
+            name: device.name,
+            detail: BluetoothPrinterDevice(address: device.address),
+          ))
+      .toList();
 
   /// Starts a scan for Bluetooth Low Energy devices
   /// Timeout closes the stream after a specified [Duration]
@@ -125,7 +118,7 @@ class BluetoothPrinterConnector implements PrinterConnector<BluetoothPrinterInpu
     // Clear scan results list
     _scanResults.add(<PrinterDevice>[]);
 
-    if (Platform.isAndroid) {
+    if (defaultTargetPlatform == TargetPlatform.android) {
       isBle ? flutterPrinterChannel.invokeMethod('getBluetoothLeList') : flutterPrinterChannel.invokeMethod('getBluetoothList');
 
       await for (dynamic data in _methodStream
@@ -139,7 +132,7 @@ class BluetoothPrinterConnector implements PrinterConnector<BluetoothPrinterInpu
         if (!_addDevice(device)) continue;
         yield device;
       }
-    } else if (Platform.isIOS) {
+    } else if (defaultTargetPlatform == TargetPlatform.iOS) {
       try {
         await iosChannel.invokeMethod('startScan');
       } catch (e) {
@@ -184,22 +177,24 @@ class BluetoothPrinterConnector implements PrinterConnector<BluetoothPrinterInpu
 
   /// Stops a scan for Bluetooth Low Energy devices
   Future stopScan() async {
-    if (Platform.isIOS) await iosChannel.invokeMethod('stopScan');
+    if (defaultTargetPlatform == TargetPlatform.iOS) await iosChannel.invokeMethod('stopScan');
     _stopScanPill.add(null);
     _isScanning.add(false);
   }
 
-  Future<bool> _connect({BluetoothPrinterInput? model}) async {
-    if (Platform.isAndroid) {
+  Future<bool> _connect(BluetoothPrinterInput model) async {
+    if (defaultTargetPlatform == TargetPlatform.android) {
       Map<String, dynamic> params = {
-        "address": model?.address ?? address,
-        "isBle": model?.isBle ?? isBle,
-        "autoConnect": model?.autoConnect ?? false
+        "address": model.address,
+        "isBle": model.isBle,
+        "autoConnect": model.autoConnect,
+        "connectTimeoutMs": connectTimeout.inMilliseconds,
       };
-      return await flutterPrinterChannel.invokeMethod('onStartConnection', params);
-    } else if (Platform.isIOS) {
-      Map<String, dynamic> params = {"name": model?.name ?? name, "address": model?.address ?? address};
-      return await iosChannel.invokeMethod('connect', params);
+      final connected = flutterPrinterChannel.invokeMethod<bool>('onStartConnection', params);
+      return await connected.timeout(connectTimeout + nativeDeadlineMargin, onTimeout: () => false) ?? false;
+    } else if (defaultTargetPlatform == TargetPlatform.iOS) {
+      Map<String, dynamic> params = {"name": model.name ?? name, "address": model.address};
+      return await iosChannel.invokeMethod<bool>('connect', params).timeout(connectTimeout, onTimeout: () => false) ?? false;
     }
     return false;
   }
@@ -222,40 +217,52 @@ class BluetoothPrinterConnector implements PrinterConnector<BluetoothPrinterInpu
 
   @override
   Future<bool> disconnect({int? delayMs}) async {
-    if (Platform.isAndroid)
-      await flutterPrinterChannel.invokeMethod('disconnect');
-    else if (Platform.isIOS) await iosChannel.invokeMethod('disconnect');
+    if (defaultTargetPlatform == TargetPlatform.android) return await flutterPrinterChannel.invokeMethod<bool>('disconnect') ?? false;
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      await iosChannel.invokeMethod('disconnect');
+      return true;
+    }
     return false;
   }
 
   Future<dynamic> destroy() => iosChannel.invokeMethod('destroy');
 
+  Duration connectTimeout = const Duration(seconds: 20);
+  Duration writeTimeout = const Duration(seconds: 60);
+  Duration confirmTimeout = const Duration(seconds: 30);
+
+  BluetoothPrinterInput? _lastConnected;
+
+  // See README.md, "Print results" (wrong printer).
   @override
-  Future<bool> send(List<int> bytes) async {
+  Future<PrintResult> send(List<int> bytes) async {
     try {
-      if (Platform.isAndroid) {
-        // final connected = await _connect();
-        // if (!connected) return false;
-        Map<String, dynamic> params = {"bytes": bytes};
-        return await flutterPrinterChannel.invokeMethod('sendDataByte', params);
-      } else if (Platform.isIOS) {
-        Map<String, Object> args = Map();
-        args['bytes'] = bytes;
-        args['length'] = bytes.length;
-        iosChannel.invokeMethod('writeData', args);
-        return Future.value(true);
+      if (defaultTargetPlatform == TargetPlatform.android) {
+        final printer = _lastConnected;
+        final reply = await flutterPrinterChannel.invokeMethod<Object?>('sendDataByte', {
+          'bytes': bytes,
+          'writeTimeoutMs': writeTimeout.inMilliseconds,
+          'confirmTimeoutMs': confirmTimeout.inMilliseconds,
+          if (printer != null) 'address': printer.address,
+          if (printer != null) 'isBle': printer.isBle,
+        });
+        return printResultFromPlatformReply(reply);
+      } else if (defaultTargetPlatform == TargetPlatform.iOS) {
+        await iosChannel.invokeMethod<Object?>('writeData', {'bytes': bytes, 'length': bytes.length});
+        return const PrintUnconfirmed('Sent over Bluetooth. iOS gives no printer confirmation.');
       } else {
-        return false;
+        return const PrintFailed('Bluetooth printing works only on Android and iOS');
       }
-    } catch (e) {
-      return false;
+    } on PlatformException catch (error) {
+      return PrintCutOff('Bluetooth send stopped, so part of the job may have been sent: ${error.message ?? error.code}');
     }
   }
 
   @override
   Future<bool> connect(BluetoothPrinterInput model) async {
+    _lastConnected = model;
     try {
-      return await _connect(model: model);
+      return await _connect(model);
     } catch (e) {
       return false;
     }

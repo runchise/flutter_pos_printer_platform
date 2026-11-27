@@ -111,19 +111,22 @@ namespace
     }
     else if (method_call.method_name().compare("printBytes") == 0)
     {
-      std::vector<uint8_t> bytes;
-
+      const std::vector<uint8_t> *bytes = nullptr;
       if (args)
       {
         auto bytes_it = args->find(EncodableValue("bytes"));
         if (bytes_it != args->end())
         {
-          bytes = std::get<std::vector<uint8_t>>(bytes_it->second);
+          bytes = std::get_if<std::vector<uint8_t>>(&bytes_it->second);
         }
-
-        auto success = PrintManager::printBytes(bytes);
-        return result->Success(EncodableValue(success));
       }
+
+      auto outcome = bytes ? PrintManager::printBytes(*bytes)
+                           : SpoolerOutcome{"failed", "printBytes got no bytes argument"};
+      auto reply = EncodableMap{};
+      reply[EncodableValue("outcome")] = EncodableValue(outcome.outcome);
+      reply[EncodableValue("reason")] = EncodableValue(outcome.reason);
+      return result->Success(EncodableValue(reply));
     }
     else
     {

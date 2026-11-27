@@ -3,6 +3,7 @@ library flutter_pos_printer_platform_image_3;
 export './src/connectors/usb.dart';
 export './src/connectors/bluetooth.dart';
 export './src/utils.dart';
+export './src/print_result.dart';
 export './src/connectors/tcp.dart';
 export './src/printers/escpos.dart';
 export './src/printers/star.dart';
